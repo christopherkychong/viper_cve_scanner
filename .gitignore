@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+*.db
+*.log
+
+# Data
+/data/epss/
+/data/healthcare/
+/data/energy/
