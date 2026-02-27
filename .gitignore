@@ -1,12 +1,72 @@
-# Python
-__pycache__/
-*.py[cod]
-venv/
-.env
-*.db
-*.log
+# === SECURITY - NEVER COMMIT THESE ===
+.env                      # Environment variables with API keys
+.env.local
+.env.*
+!.env.example
 
-# Data
-/data/epss/
-/data/healthcare/
-/data/energy/
+# === Python Bytecode & Cache ===
+__pycache__/              # Compiled Python files
+*.py[cod]                 # Python bytecode
+*$py.class
+*.so
+.python-version           # Python version specification
+.mypy_cache/              # MyPy type checker cache
+.ruff_cache/              # Ruff linter cache
+.pytest_cache/            # Pytest cache
+.coverage                 # Coverage reports
+htmlcov/                  # HTML coverage reports
+.tox/                     # Tox testing environment
+.nox/                     # Nox testing environment
+
+# === Virtual Environments ===
+venv/                     # Virtual environment directory
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+
+# === Project Data (Auto-generated) ===
+/data/epss/               # Downloaded EPSS data
+/data/healthcare/         # Healthcare sector data
+/data/energy/             # Energy sector data
+/data/kev/                # KEV catalog data
+/data/nvd/                # NVD data cache
+/data/keyword_backups/    # Keyword backup files
+*.db                      # SQLite database files
+*.sqlite3
+*.log                     # Log files
+*.csv                     # Exported CSV data
+*.json                    # JSON data files
+!src/utils/keywords.json  # Except the main keyword file
+
+# === IDE / Editor Files ===
+.vscode/                  # VS Code settings
+.idea/                    # PyCharm settings
+*.swp                     # Vim swap files
+*.swo
+*~
+.DS_Store                 # macOS folder metadata
+Thumbs.db                 # Windows thumbnail cache
+.history/                 # Shell history
+
+# === Distribution / Build ===
+dist/                     # Distribution packages
+build/
+*.egg-info/
+.eggs/
+MANIFEST
+
+# === Jupyter Notebooks ===
+.ipynb_checkpoints/       # Notebook checkpoints
+*.ipynb                   # Notebook files (if any)
+
+# === OS Generated Files ===
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
