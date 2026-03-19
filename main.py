@@ -37,7 +37,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     # Run streamlit as a module to ensure proper Python path resolution
-    cmd = [sys.executable, "-m", "streamlit", "hello"]
+    cmd = [sys.executable, "-m", "streamlit", "run", "src/dashboard/app.py"]
     
     try:
         # Launch the dashboard and wait for it to complete
