@@ -1,0 +1,119 @@
+{
+  "healthcare": {
+    "medical_devices": [
+      "implant",
+      "pacemaker",
+      "infusion pump",
+      "ventilator",
+      "mri",
+      "ct scanner",
+      "x-ray",
+      "ultrasound",
+      "patient monitor",
+      "defibrillator",
+      "anesthesia",
+      "dialysis",
+      "surgical robot",
+      "medical device"
+    ],
+    "healthcare_it": [
+      "ehr",
+      "emr",
+      "epic",
+      "cerner",
+      "meditech",
+      "hl7",
+      "dicom",
+      "pacs",
+      "ris",
+      "lis",
+      "hospital information system",
+      "phi",
+      "ephi",
+      "patient data",
+      "medical record",
+      "hipaa"
+    ],
+    "vendors": [
+      "philips",
+      "ge healthcare",
+      "medtronic",
+      "baxter",
+      "becton dickinson",
+      "bd",
+      "boston scientific",
+      "abbott",
+      "stryker",
+      "zimmer",
+      "siemens healthineers"
+    ],
+    "clinical_context": [
+      "patient safety",
+      "clinical",
+      "hospital",
+      "operating room",
+      "icu",
+      "critical care",
+      "surgery",
+      "treatment",
+      "diagnosis"
+    ]
+  },
+  "energy": {
+    "ot_ics": [
+      "scada",
+      "plc",
+      "ics",
+      "industrial control",
+      "operational technology",
+      "historian",
+      "modbus",
+      "profibus",
+      "dnp3",
+      "opc",
+      "opc ua",
+      "iec61850"
+    ],
+    "infrastructure": [
+      "power grid",
+      "substation",
+      "transformer",
+      "generator",
+      "turbine",
+      "smart meter",
+      "pipeline",
+      "refinery",
+      "plant floor",
+      "distribution",
+      "transmission",
+      "electrical",
+      "utility"
+    ],
+    "vendors": [
+      "siemens",
+      "schneider",
+      "rockwell",
+      "abb",
+      "honeywell",
+      "emerson",
+      "ge digital",
+      "wonderware",
+      "ignition",
+      "yokogawa",
+      "omron"
+    ],
+    "components": [
+      "hmi",
+      "rtu",
+      "mtu",
+      "historian",
+      "opc server",
+      "opc client",
+      "controller",
+      "actuator",
+      "sensor",
+      "relay",
+      "breaker"
+    ]
+  }
+}
