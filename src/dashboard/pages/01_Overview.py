@@ -7,7 +7,7 @@ This page serves as the main dashboard with:
 - Manual update button with live output
 - Sector tagging (Healthcare, Energy, Other)
 - Priority filtering
-- Export functionality for uncategorized CVEs
+- Download top 1000 uncategorized CVEs as CSV for keyword discovery
 """
 
 import sys
@@ -19,6 +19,7 @@ import pandas as pd
 import subprocess
 import sqlite3
 from datetime import datetime
+import io
 
 # Force reload keywords from file on every page load
 import importlib
@@ -48,20 +49,177 @@ if 'update_running' not in st.session_state:
     st.session_state.update_running = False
 
 db = DatabaseHandler()
-all_cves = db.get_all_cves(limit=1000)
 
-# Get last update information for each data source
+def load_cves_with_epss(limit=10000):
+    """
+    Load CVEs with their EPSS scores, sorted by Priority 1 first, then by EPSS descending.
+    """
+    conn = sqlite3.connect(db.db_path)
+    conn.row_factory = sqlite3.Row
+    
+    query = """
+        SELECT c.cve_id, c.description, c.cvss_score, c.in_kev, e.epss_score
+        FROM cves c
+        LEFT JOIN epss_scores e ON c.cve_id = e.cve_id
+        ORDER BY 
+            CASE 
+                WHEN c.in_kev = 1 THEN 0
+                WHEN e.epss_score > 0.2 AND c.cvss_score > 7.0 THEN 1
+                WHEN c.cvss_score > 7.0 THEN 2
+                WHEN e.epss_score > 0.2 THEN 3
+                ELSE 4
+            END,
+            e.epss_score DESC NULLS LAST,
+            c.cvss_score DESC NULLS LAST
+        LIMIT ?
+    """
+    cursor = conn.execute(query, (limit,))
+    rows = cursor.fetchall()
+    cves_list = [dict(row) for row in rows]
+    conn.close()
+    
+    return cves_list
+
+def load_top_uncategorized_cves(limit=1000):
+    """
+    Load top N uncategorized CVEs sorted by priority:
+    Priority 1+ (KEV) first, then Priority 1, then Priority 2, then Priority 3, then Priority 4.
+    """
+    conn = sqlite3.connect(db.db_path)
+    
+    # Load all CVEs with their scores
+    query = """
+        SELECT c.cve_id, c.description, c.cvss_score, c.in_kev, 
+               COALESCE(e.epss_score, 0) as epss_score
+        FROM cves c
+        LEFT JOIN epss_scores e ON c.cve_id = e.cve_id
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    
+    # Load keywords for sector classification
+    healthcare_keywords, energy_keywords = get_keywords_from_filter()
+    
+    # Filter to uncategorized only
+    def is_other(desc):
+        if not desc:
+            return True
+        desc_lower = desc.lower()
+        if any(kw.lower() in desc_lower for kw in healthcare_keywords):
+            return False
+        if any(kw.lower() in desc_lower for kw in energy_keywords):
+            return False
+        return True
+    
+    df['is_other'] = df['description'].apply(is_other)
+    other_df = df[df['is_other']].copy()
+    
+    # Calculate priority
+    def get_priority(row):
+        in_kev = row['in_kev']
+        epss = row['epss_score']
+        cvss = row['cvss_score']
+        
+        if in_kev == 1:
+            return 0  # Priority 1+ (highest)
+        elif epss > 0.2 and cvss > 7.0:
+            return 1  # Priority 1
+        elif cvss > 7.0:
+            return 2  # Priority 2
+        elif epss > 0.2:
+            return 3  # Priority 3
+        else:
+            return 4  # Priority 4
+    
+    other_df['priority_order'] = other_df.apply(get_priority, axis=1)
+    
+    # Sort by priority_order, then by EPSS desc, then by CVSS desc
+    other_df = other_df.sort_values(
+        ['priority_order', 'epss_score', 'cvss_score'], 
+        ascending=[True, False, False]
+    )
+    
+    # Return top N
+    top_df = other_df.head(limit).copy()
+    
+    # Add priority label for display
+    def get_priority_label(row):
+        in_kev = row['in_kev']
+        epss = row['epss_score']
+        cvss = row['cvss_score']
+        
+        if in_kev == 1:
+            return "PRIORITY 1+ (IMMEDIATE)"
+        elif epss > 0.2 and cvss > 7.0:
+            return "PRIORITY 1 (This week)"
+        elif cvss > 7.0:
+            return "PRIORITY 2 (Schedule)"
+        elif epss > 0.2:
+            return "PRIORITY 3 (Monitor)"
+        else:
+            return "PRIORITY 4 (Deprioritize)"
+    
+    top_df['priority'] = top_df.apply(get_priority_label, axis=1)
+    
+    # Select and rename columns for CSV
+    result_df = top_df[['cve_id', 'description', 'cvss_score', 'epss_score', 'in_kev', 'priority']].copy()
+    result_df['in_kev'] = result_df['in_kev'].map({1: 'Yes', 0: 'No'})
+    
+    return result_df
+
+def calculate_priority(cvss_score, epss_score, in_kev):
+    """Calculate priority label matching export script"""
+    if pd.isna(epss_score):
+        epss_score = None
+    
+    if in_kev == 1:
+        return "PRIORITY 1+ (IMMEDIATE)"
+    elif epss_score is not None and epss_score > 0.2 and cvss_score is not None and cvss_score > 7.0:
+        return "PRIORITY 1 (This week)"
+    elif cvss_score is not None and cvss_score > 7.0:
+        return "PRIORITY 2 (Schedule)"
+    elif epss_score is not None and epss_score > 0.2:
+        return "PRIORITY 3 (Monitor)"
+    elif epss_score is None and cvss_score is None:
+        return "PRIORITY UNKNOWN (Missing data)"
+    else:
+        return "PRIORITY 4 (Deprioritize)"
+
+def get_keywords_from_filter():
+    try:
+        healthcare_keywords = []
+        energy_keywords = []
+        
+        if hasattr(industry_filter, 'keywords'):
+            if 'healthcare' in industry_filter.keywords:
+                for cat in industry_filter.keywords['healthcare'].values():
+                    healthcare_keywords.extend(cat)
+            if 'energy' in industry_filter.keywords:
+                for cat in industry_filter.keywords['energy'].values():
+                    energy_keywords.extend(cat)
+        
+        return healthcare_keywords, energy_keywords
+    except Exception as e:
+        st.error(f"Error getting keywords: {e}")
+        return [], []
+
+# Load CVEs for display
+all_cves = load_cves_with_epss(limit=10000)
+
+# Add priority label to each CVE
+for cve in all_cves:
+    cve['priority'] = calculate_priority(
+        cve.get('cvss_score'),
+        cve.get('epss_score'),
+        cve.get('in_kev', 0)
+    )
+
+# Get last update information
 nvd_update = db.get_last_update('nvd')
 epss_update = db.get_last_update('epss')
 kev_update = db.get_last_update('kev')
 
 def get_current_counts():
-    """
-    Get current record counts from the database.
-    
-    Returns:
-        Dictionary with counts for cves, epss_scores, and kev records
-    """
     conn = sqlite3.connect(db.db_path)
     cursor = conn.cursor()
     
@@ -82,29 +240,25 @@ def get_current_counts():
         'kev': kev_count
     }
 
-def run_updater_with_output():
-    """
-    Run the updater and capture real-time output for display.
-    
-    Returns:
-        Tuple of (success boolean, complete output string)
-    """
-    output = []
+def run_updater_with_live_output():
+    output_lines = []
     process = subprocess.Popen(
-        [sys.executable, "-m", "src.updater"],
+        [sys.executable, "-u", "-m", "src.updater"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1
     )
     
+    output_placeholder = st.empty()
+    
     for line in process.stdout:
-        output.append(line)
-        # Keep only the last 50 lines to avoid memory issues
-        st.session_state.update_output = "\n".join(output[-50:])
+        output_lines.append(line)
+        output_placeholder.code(''.join(output_lines[-50:]), language="text")
+        st.session_state.update_output = "\n".join(output_lines[-50:])
     
     process.wait()
-    return process.returncode == 0, "\n".join(output)
+    return process.returncode == 0, "".join(output_lines)
 
 # SIDEBAR - Data Source Status
 st.sidebar.header("📊 Data Source Status")
@@ -130,12 +284,11 @@ if kev_update:
 else:
     st.sidebar.warning("⚠️ KEV: No data")
 
-# UPDATE BUTTON
+# UPDATE BUTTON (No Export Button)
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Manual Update")
 
 if st.sidebar.button("🚀 Run Full Update Now", type="primary", use_container_width=True):
-    # Store counts before update for comparison
     st.session_state.before_counts = get_current_counts()
     st.session_state.update_running = True
     st.session_state.update_output = ""
@@ -143,16 +296,21 @@ if st.sidebar.button("🚀 Run Full Update Now", type="primary", use_container_w
 
 # Show live update output if update is running
 if st.session_state.update_running:
-    st.subheader("📟 Live Update Output")
-    success, full_output = run_updater_with_output()
+    with st.status("Running VIPER Update...", expanded=True) as status:
+        success, full_output = run_updater_with_live_output()
+        
+        st.session_state.after_counts = get_current_counts()
+        st.session_state.update_success = success
+        st.session_state.update_message = "✅ Update completed successfully!" if success else "❌ Update failed"
+        st.session_state.update_timestamp = datetime.now()
+        st.session_state.update_output = full_output
+        st.session_state.update_running = False
+        
+        if success:
+            status.update(label="✅ Update Complete!", state="complete")
+        else:
+            status.update(label="❌ Update Failed", state="error")
     
-    # Get counts after update for comparison
-    st.session_state.after_counts = get_current_counts()
-    st.session_state.update_success = success
-    st.session_state.update_message = "✅ Update completed successfully!" if success else "❌ Update failed"
-    st.session_state.update_timestamp = datetime.now()
-    st.session_state.update_running = False
-    st.session_state.update_output = full_output
     st.rerun()
 
 # Display update output if available
@@ -160,12 +318,11 @@ if st.session_state.update_output and not st.session_state.update_running:
     with st.expander("📋 Last Update Output", expanded=False):
         st.text(st.session_state.update_output)
 
-# Show detailed update confirmation with before/after counts
+# Show detailed update confirmation
 if st.session_state.update_success and st.session_state.before_counts and st.session_state.after_counts:
     st.success(f"✅ {st.session_state.update_message}")
     st.balloons()
     
-    # Calculate and display changes
     before = st.session_state.before_counts
     after = st.session_state.after_counts
     
@@ -192,7 +349,6 @@ if st.session_state.update_success and st.session_state.before_counts and st.ses
             delta=f"+{kev_change}" if kev_change > 0 else "No change"
         )
     
-    # Verify database was populated
     if after['cves'] > 0:
         st.info(f"✅ Verified: {after['cves']} CVEs are now in the database table.")
     else:
@@ -200,7 +356,6 @@ if st.session_state.update_success and st.session_state.before_counts and st.ses
     
     st.caption(f"Update completed at: {st.session_state.update_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Clear button to dismiss confirmation
     if st.button("Clear confirmation"):
         st.session_state.update_success = False
         st.session_state.before_counts = None
@@ -210,7 +365,7 @@ if st.session_state.update_success and st.session_state.before_counts and st.ses
     
     st.markdown("---")
 
-# Check if NVD data exists - if not, show critical warning
+# Check if NVD data exists
 if not nvd_update or nvd_update[1] == 0:
     st.error("""
         🚨 **CRITICAL: No NVD Data Found**
@@ -218,34 +373,11 @@ if not nvd_update or nvd_update[1] == 0:
         VIPER requires NVD CVE descriptions to function. 
         Please run the updater immediately: python -m src.updater """)
 
-# MAIN CONTENT - Sector Tagging
+# =========================================================
+# MAIN CONTENT - Sector Tagging and Table
+# =========================================================
 st.markdown("---")
 
-def get_keywords_from_filter():
-    """
-    Extract all healthcare and energy keywords from the industry filter.
-    
-    Returns:
-        Tuple of (healthcare_keywords list, energy_keywords list)
-    """
-    try:
-        healthcare_keywords = []
-        energy_keywords = []
-        
-        if hasattr(industry_filter, 'keywords'):
-            if 'healthcare' in industry_filter.keywords:
-                for cat in industry_filter.keywords['healthcare'].values():
-                    healthcare_keywords.extend(cat)
-            if 'energy' in industry_filter.keywords:
-                for cat in industry_filter.keywords['energy'].values():
-                    energy_keywords.extend(cat)
-        
-        return healthcare_keywords, energy_keywords
-    except Exception as e:
-        st.error(f"Error getting keywords: {e}")
-        return [], []
-
-# Load keywords from filter
 HEALTHCARE_KEYWORDS, ENERGY_KEYWORDS = get_keywords_from_filter()
 
 # Process CVEs with sector tags
@@ -254,9 +386,9 @@ if all_cves:
         desc = cve.get('description', '').lower()
         sectors = []
         
-        if any(k.lower() in desc for k in HEALTHCARE_KEYWORDS):
+        if any(kw.lower() in desc for kw in HEALTHCARE_KEYWORDS):
             sectors.append("🏥 Healthcare")
-        if any(k.lower() in desc for k in ENERGY_KEYWORDS):
+        if any(kw.lower() in desc for kw in ENERGY_KEYWORDS):
             sectors.append("⚡ Energy")
         
         cve['sector'] = ', '.join(sectors) if sectors else '📦 Other'
@@ -296,25 +428,29 @@ if all_cves:
     st.markdown("---")
     
     # Main data table
-    st.subheader("📋 CVEs with Priority and Sector")
+    st.subheader("📋 CVEs (Sorted by Priority 1 First, then by EPSS)")
     
-    display_cols = ['cve_id', 'description', 'cvss_score', 'epss_score', 
-                    'priority', 'sector', 'in_kev']
+    # Select columns for display
+    display_cols = ['cve_id', 'description', 'cvss_score', 'epss_score', 'priority', 'sector', 'in_kev']
+    available_cols = [col for col in display_cols if col in df.columns]
     
-    # Format boolean for display
+    # Format KEV for display
     if 'in_kev' in df.columns:
-        df['in_kev'] = df['in_kev'].map({1: '✅ Yes', 0: '❌ No'})
+        df['in_kev_display'] = df['in_kev'].map({1: '✅ Yes', 0: '❌ No'})
+        available_cols = [c if c != 'in_kev' else 'in_kev_display' for c in available_cols]
     
-    # Rename columns for readability
-    display_df = df[display_cols].rename(columns={
+    # Rename columns
+    rename_map = {
         'cve_id': 'CVE ID',
         'description': 'Description',
         'cvss_score': 'CVSS',
         'epss_score': 'EPSS',
         'priority': 'Priority',
         'sector': 'Sector',
-        'in_kev': 'In KEV'
-    })
+        'in_kev_display': 'In KEV'
+    }
+    
+    display_df = df[available_cols].rename(columns=rename_map)
     
     st.dataframe(
         display_df.head(500),
@@ -322,43 +458,61 @@ if all_cves:
         height=600
     )
     
-    # Filter by priority
+    # Filter by priority dropdown
     st.markdown("### 🔍 Filter by Priority")
-    priority_options = ["All", "🔴 PRIORITY 1+", "🟠 PRIORITY 1", "🟡 PRIORITY 2", "🟢 PRIORITY 3", "⚪ PRIORITY 4"]
-    selected = st.selectbox("Choose priority level", priority_options)
+    priority_filter_options = ["All", "PRIORITY 1+ (IMMEDIATE)", "PRIORITY 1 (This week)", "PRIORITY 2 (Schedule)", "PRIORITY 3 (Monitor)", "PRIORITY 4 (Deprioritize)", "PRIORITY UNKNOWN (Missing data)"]
+    selected_priority = st.selectbox("Choose priority level", priority_filter_options)
     
-    if selected != "All":
-        filtered = display_df[display_df['Priority'].str.contains(selected[:10])]
+    if selected_priority != "All":
+        filtered = display_df[display_df['Priority'] == selected_priority]
         st.dataframe(filtered, use_container_width=True, height=400)
     
-    # Export uncategorized CVEs for analysis
-    st.markdown("### 📤 Export Uncategorized CVEs")
-    st.caption("CVEs marked as 'Other' can be analyzed in external tools to discover new keywords.")
+    # =========================================================
+    # DOWNLOAD TOP 1000 UNCATEGORIZED CVEs AS CSV
+    # =========================================================
+    st.markdown("---")
+    st.subheader("📥 Download Uncategorized CVEs for Keyword Discovery")
+    st.caption("CVEs marked as 'Other' have not matched any healthcare or energy keywords.")
+    st.caption("Sorted by priority: Priority 1+ (KEV) first, then Priority 1, Priority 2, Priority 3.")
+    st.caption("Download the CSV file to analyze in Excel or other spreadsheet programs.")
     
-    other_cves = df[df['sector'] == '📦 Other'][['cve_id', 'description']].head(50)
+    # Load top 1000 uncategorized CVEs (prioritized)
+    top_uncategorized_df = load_top_uncategorized_cves(limit=1000)
     
-    if not other_cves.empty:
-        # Format for easy copying
-        export_text = ""
-        for _, row in other_cves.iterrows():
-            export_text += f"{row['cve_id']}: {row['description']}\n\n"
+    if not top_uncategorized_df.empty:
+        # Create CSV in memory
+        csv_buffer = io.StringIO()
+        top_uncategorized_df.to_csv(csv_buffer, index=False)
+        csv_data = csv_buffer.getvalue()
         
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.code(export_text, language="text")
-            
-        with col2:
-            st.info("""
-                💡 **How to use:**
-                1. Click the copy button in the top-right corner
-                2. Paste into your preferred analysis tool
-                3. Look for common terms or patterns
-                4. Add new keywords via the Keyword Management page
-            """)
+        # Count priorities for display
+        p1plus_count = len(top_uncategorized_df[top_uncategorized_df['priority'] == "PRIORITY 1+ (IMMEDIATE)"])
+        p1_count = len(top_uncategorized_df[top_uncategorized_df['priority'] == "PRIORITY 1 (This week)"])
+        p2_count = len(top_uncategorized_df[top_uncategorized_df['priority'] == "PRIORITY 2 (Schedule)"])
+        p3_count = len(top_uncategorized_df[top_uncategorized_df['priority'] == "PRIORITY 3 (Monitor)"])
+        p4_count = len(top_uncategorized_df[top_uncategorized_df['priority'] == "PRIORITY 4 (Deprioritize)"])
         
-        st.caption(f"Showing {len(other_cves)} uncategorized CVEs")
+        st.info(f"""
+        **Top 1000 Uncategorized CVEs by Priority:**
+        - 🔴 Priority 1+ (KEV): {p1plus_count}
+        - 🟠 Priority 1 (CVSS>7.0 & EPSS>0.2): {p1_count}
+        - 🟡 Priority 2 (CVSS>7.0 only): {p2_count}
+        - 🟢 Priority 3 (EPSS>0.2 only): {p3_count}
+        - ⚪ Priority 4 (Lower priority): {p4_count}
+        """)
+        
+        # Download button
+        st.download_button(
+            label="📥 Download Top 1000 Uncategorized CVEs (CSV)",
+            data=csv_data,
+            file_name=f"uncategorized_cves_top1000_{datetime.now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+        
+        st.caption(f"Showing top 1000 of {other_count:,} total uncategorized CVEs.")
     else:
-        st.success("🎉 No uncategorized CVEs!")
+        st.success("🎉 No uncategorized CVEs found!")
 
 else:
     st.warning("No CVE data available. Run updater first.")

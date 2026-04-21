@@ -1,17 +1,10 @@
 """
 Master Updater for VIPER
-Runs all data fetchers in sequence with proper error handling.
-
-This module orchestrates the complete update process:
-1. EPSS scores (nice to have, non-critical)
-2. NVD CVE data (CRITICAL - app cannot function without descriptions)
-3. CISA KEV catalog (enhancement, non-critical)
-
-NVD is treated as critical because without descriptions, sector filtering
-and vulnerability understanding is impossible. If NVD fails, the entire
-update is aborted to prevent inconsistent data.
+Runs all data fetchers in sequence
+NVD is CRITICAL - update fails if NVD fails
 """
 
+import time
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -21,69 +14,22 @@ from src.data_collection.epss_fetcher import EPSSFetcher
 from src.utils.database_handler import DatabaseHandler
 
 class VIPERUpdater:
-    """
-    Orchestrates all data updates with proper error handling.
-    
-    NVD updates are treated as critical failures - if NVD returns no data,
-    the entire update is aborted to prevent database corruption. EPSS and KEV
-    updates are allowed to fail without aborting the update.
-    """
+    """Orchestrates all data updates - NVD is CRITICAL"""
     
     def __init__(self, nvd_api_key=None):
-        """Initialize all data fetchers and the database handler."""
         self.nvd_fetcher = NVDFetcher(api_key=nvd_api_key)
         self.kev_fetcher = KEVFetcher()
         self.epss_fetcher = EPSSFetcher()
         self.db = DatabaseHandler()
-    
-    def run_all_updates(self):
-        """
-        Execute the complete update cycle with proper error handling.
         
-        Returns:
-            True if update successful (NVD succeeded), False if NVD failed
-        """
+    def run_all_updates(self):
+        """Run complete update cycle - NVD failure stops everything"""
         print("\n" + "="*60)
         print(f"VIPER UPDATE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
         
-        # Step 1: EPSS Scores (nice to have, not critical)
-        print("\nSTEP 1: EPSS Scores")
-        epss_success = self.epss_fetcher.update_database()
-        if epss_success:
-            print("EPSS update successful")
-        else:
-            print("WARNING: EPSS update failed - continuing anyway")
-        
-        # Step 2: NVD CVE Data (CRITICAL - app cannot function without this)
-        print("\nSTEP 2: NVD CVE Data (CRITICAL)")
-        print("Fetching CVEs from last 30 days...")
-        
-        cves = self.nvd_fetcher.fetch_recent_cves(days_back=30, limit=1000)
-        
-        # Check if NVD returned any data
-        if not cves:
-            print("\n" + "!"*60)
-            print("CRITICAL FAILURE: NVD FETCH RETURNED NO DATA")
-            print("VIPER cannot function without CVE descriptions")
-            print("Update ABORTED - no data saved")
-            print("!"*60 + "\n")
-            return False
-        
-        # Save NVD data to database
-        save_success = self.nvd_fetcher.save_to_database(self.db, cves)
-        
-        if not save_success:
-            print("\n" + "!"*60)
-            print("CRITICAL FAILURE: NVD DATA COULD NOT BE SAVED TO DATABASE")
-            print("Update ABORTED - database may be corrupted")
-            print("!"*60 + "\n")
-            return False
-        
-        print("NVD update successful - database populated")
-        
-        # Step 3: CISA KEV Catalog (enhancement, not critical)
-        print("\nSTEP 3: CISA KEV Catalog")
+        # Step 1: CISA KEV Catalog (fastest, provides immediate feedback)
+        print("\nSTEP 1: CISA KEV Catalog")
         kev_data = self.kev_fetcher.fetch_catalog()
         if kev_data:
             kev_set = self.kev_fetcher.get_kev_set()
@@ -92,28 +38,45 @@ class VIPERUpdater:
         else:
             print("WARNING: KEV update failed - continuing anyway")
         
+        # Step 2: NVD CVE Data (CRITICAL - fetch ALL CVEs in batches)
+        print("\nSTEP 2: NVD CVE Data (CRITICAL)")
+        print("Fetching ALL CVEs from NVD in batches (this may take 10-30 minutes)...")
+        
+        success = self.nvd_fetcher.fetch_cves_by_current_year(self.db)
+        
+        if not success:
+            print("\n" + "!"*60)
+            print("CRITICAL FAILURE: NVD FETCH FAILED")
+            print("VIPER cannot function without CVE descriptions")
+            print("Update ABORTED - no data saved")
+            print("!"*60 + "\n")
+            return False
+        
+        print("NVD update successful - database populated")
+        
+        # Step 3: EPSS Scores (nice to have, not critical)
+        print("\nSTEP 3: EPSS Scores")
+        epss_success = self.epss_fetcher.update_database()
+        if epss_success:
+            print("EPSS update successful")
+        else:
+            print("WARNING: EPSS update failed - continuing anyway")
+        
         print("\n" + "="*60)
         print("UPDATE COMPLETE - ALL CRITICAL SYSTEMS GO")
-        print(f"NVD: {len(cves)} CVEs loaded")
         print("="*60 + "\n")
         return True
     
     def run_epss_only(self):
-        """Run only the EPSS update (for testing or manual refresh)."""
+        """Run only EPSS update"""
         print("Running EPSS update only...")
         self.epss_fetcher.update_database()
     
     def run_nvd_only(self):
-        """
-        Run only the NVD update (CRITICAL).
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        print("Running NVD update only (CRITICAL)...")
-        cves = self.nvd_fetcher.fetch_recent_cves(days_back=30, limit=1000)
-        if cves:
-            self.nvd_fetcher.save_to_database(self.db, cves)
+        """Run only NVD update (CRITICAL) - fetches CVEs for current year"""
+        print("Running NVD update only (fetching CVEs for current year)...")
+        success = self.nvd_fetcher.fetch_cves_by_current_year(self.db)
+        if success:
             print("NVD update successful")
             return True
         else:
@@ -121,7 +84,7 @@ class VIPERUpdater:
             return False
     
     def run_kev_only(self):
-        """Run only the KEV update (for testing or manual refresh)."""
+        """Run only KEV update"""
         print("Running KEV update only...")
         kev_data = self.kev_fetcher.fetch_catalog()
         if kev_data:
@@ -129,11 +92,11 @@ class VIPERUpdater:
             self.db.update_kev_status(kev_set)
 
 
-# Command-line interface for running updates
 if __name__ == "__main__":
+    import sys
+    
     updater = VIPERUpdater()
     
-    # Parse command line arguments for selective updates
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
         if cmd == 'epss':
@@ -141,7 +104,7 @@ if __name__ == "__main__":
         elif cmd == 'nvd':
             success = updater.run_nvd_only()
             if not success:
-                sys.exit(1)  # Exit with error code for scripting
+                sys.exit(1)
         elif cmd == 'kev':
             updater.run_kev_only()
         else:
@@ -152,3 +115,8 @@ if __name__ == "__main__":
         success = updater.run_all_updates()
         if not success:
             sys.exit(1)
+    
+    # Force exit to ensure process terminates
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.exit(0)

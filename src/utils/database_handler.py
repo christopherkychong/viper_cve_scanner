@@ -1,13 +1,6 @@
 """
 Database Handler for VIPER
-Manages all SQLite database operations including table creation, data insertion, and queries.
-
-This module handles:
-- Creating and initializing database tables
-- Storing CVE data from NVD
-- Managing EPSS scores and KEV status
-- Retrieving CVEs with priority calculations
-- Tracking update history for each data source
+Reads from epss_scores table with real data and sector assignment
 """
 
 import sqlite3
@@ -16,106 +9,73 @@ from pathlib import Path
 from datetime import datetime
 
 class DatabaseHandler:
-    """
-    Provides methods to interact with the SQLite database.
-    
-    Handles connections, table creation, and data operations for:
-    - CVEs (vulnerability descriptions and metadata)
-    - EPSS scores (exploitation probability)
-    - Update tracking (last run timestamps)
-    """
+    """Handles all database operations for VIPER"""
     
     def __init__(self, db_path=None):
-        """
-        Initialize the database handler and ensure tables exist.
-        
-        Args:
-            db_path: Optional custom path to the database file
-                    Defaults to 'data/viper.db'
-        """
         if db_path is None:
             self.db_path = Path("data/viper.db")
         else:
             self.db_path = Path(db_path)
         
-        # Create data directory if it doesn't exist
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_database()
     
     def init_database(self):
-        """
-        Create database tables if they don't already exist.
-        
-        Tables created:
-        - cves: Main vulnerability information
-        - epss_scores: Daily EPSS scores for trend analysis
-        - updates: Track last run times for each data source
-        """
+        """Initialize database tables if they don't exist"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Main CVEs table - stores all vulnerability information
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS cves (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cve_id TEXT UNIQUE,              -- CVE identifier (e.g., CVE-2024-1234)
-                description TEXT,                  -- Full vulnerability description from NVD
-                published_date TEXT,                -- Date CVE was published
-                cvss_score REAL,                    -- CVSS severity score (0-10)
-                severity TEXT,                       -- Text severity (LOW, MEDIUM, HIGH, CRITICAL)
-                epss_score REAL DEFAULT 0,          -- Exploitation probability (0-1)
-                in_kev INTEGER DEFAULT 0,           -- Whether in CISA's Known Exploited Vulnerabilities
-                risk_score REAL,                     -- Combined risk score (for future use)
-                last_updated TEXT                    -- Timestamp of last update
+                cve_id TEXT UNIQUE,
+                description TEXT,
+                published_date TEXT,
+                cvss_score REAL,
+                severity TEXT,
+                epss_score REAL DEFAULT 0,
+                in_kev INTEGER DEFAULT 0,
+                risk_score REAL,
+                last_updated TEXT
             )
         ''')
         
-        # EPSS scores table - stores daily scores for trend analysis
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS epss_scores (
                 cve_id TEXT PRIMARY KEY,
-                epss_score REAL,                    -- Exploitation probability score (0-1)
-                percentile REAL,                     -- Percentile rank among all CVEs
-                date TEXT                            -- Date when this score was recorded
+                epss_score REAL,
+                percentile REAL,
+                date TEXT
             )
         ''')
         
-        # Updates table - tracks when each data source was last refreshed
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS updates (
-                source TEXT PRIMARY KEY,            -- Data source name (nvd, epss, kev)
-                last_run TEXT,                       -- Timestamp of last successful update
-                records_count INTEGER                 -- Number of records processed
+                source TEXT PRIMARY KEY,
+                last_run TEXT,
+                records_count INTEGER
             )
         ''')
         
         conn.commit()
         conn.close()
     
-    def update_cve_data(self, cve_list):
-        """
-        Insert or update CVEs from NVD into the database.
-        
-        Args:
-            cve_list: List of CVE dictionaries with fields:
-                     cve_id, description, published_date, cvss_score, severity
-                     
-        Returns:
-            Number of CVEs successfully processed
-        """
+    def update_cve_data(self, cve_list, batch_size=5000):
+        """Insert or update CVEs from NVD in batches for speed"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         now = datetime.now().isoformat()
         count = 0
         
-        for cve in cve_list:
-            try:
-                cursor.execute('''
-                    INSERT OR REPLACE INTO cves 
-                    (cve_id, description, published_date, cvss_score, severity, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
+        # Process in batches
+        for i in range(0, len(cve_list), batch_size):
+            batch = cve_list[i:i+batch_size]
+            
+            # Use executemany for batch INSERT
+            data = []
+            for cve in batch:
+                data.append((
                     cve['cve_id'],
                     cve['description'],
                     cve.get('published_date', now),
@@ -123,11 +83,16 @@ class DatabaseHandler:
                     cve.get('severity', 'UNKNOWN'),
                     now
                 ))
-                count += 1
-            except Exception as e:
-                print(f"Error inserting {cve.get('cve_id')}: {e}")
+            
+            cursor.executemany('''
+                INSERT OR REPLACE INTO cves 
+                (cve_id, description, published_date, cvss_score, severity, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', data)
+            
+            conn.commit()
+            count += len(batch)
         
-        # Record this update in the updates table
         cursor.execute('''
             INSERT OR REPLACE INTO updates (source, last_run, records_count)
             VALUES ('nvd', ?, ?)
@@ -137,65 +102,67 @@ class DatabaseHandler:
         conn.close()
         return count
     
-    def update_epss_scores(self, df):
+    def update_epss_scores(self, df, append_mode=False, update_cves=True):
         """
-        Update EPSS scores in the database.
-        
-        This method:
-        1. Replaces the entire epss_scores table with new data
-        2. Updates matching records in the cves table with new EPSS scores
-        3. Records the update timestamp
-        
-        Args:
-            df: DataFrame with columns cve_id, epss_score, percentile, date
+        Update EPSS scores in database.
+        If append_mode=True, appends to existing table (for batch updates).
+        If append_mode=False, replaces entire table (for full updates).
+        If update_cves=False, skips updating the cves table (for batch speed).
         """
         conn = sqlite3.connect(self.db_path)
         
-        # Replace the epss_scores table with new data
-        df.to_sql('epss_scores', conn, if_exists='replace', index=False)
+        if append_mode:
+            # Append to existing table (for batch updates)
+            df.to_sql('epss_scores', conn, if_exists='append', index=False)
+            print(f"EPSS batch appended with {len(df)} records")
+        else:
+            # Replace entire table (for full updates)
+            df.to_sql('epss_scores', conn, if_exists='replace', index=False)
+            print(f"EPSS table replaced with {len(df)} records")
         
-        # Update the main cves table with new EPSS scores
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE cves 
-            SET epss_score = (
-                SELECT epss_score FROM epss_scores 
-                WHERE epss_scores.cve_id = cves.cve_id
-            )
-            WHERE cve_id IN (SELECT cve_id FROM epss_scores)
-        ''')
-        
-        # Record this update
-        now = datetime.now().isoformat()
-        cursor.execute('''
-            INSERT OR REPLACE INTO updates (source, last_run, records_count)
-            VALUES ('epss', ?, ?)
-        ''', (now, len(df)))
+        # Only update cves table if requested (skip during batches for speed)
+        if update_cves:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE cves 
+                SET epss_score = (
+                    SELECT epss_score FROM epss_scores 
+                    WHERE epss_scores.cve_id = cves.cve_id
+                )
+                WHERE cve_id IN (SELECT cve_id FROM epss_scores)
+            ''')
+            
+            now = datetime.now().isoformat()
+            cursor.execute('''
+                INSERT OR REPLACE INTO updates (source, last_run, records_count)
+                VALUES ('epss', ?, ?)
+            ''', (now, len(df)))
+            print(f"EPSS database fully updated with {len(df)} records")
         
         conn.commit()
         conn.close()
-        print(f"EPSS database updated with {len(df)} records")
+    
+    def clear_epss_table(self):
+        """Clear all EPSS records before daily update"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM epss_scores")
+        conn.commit()
+        conn.close()
+        print("Cleared EPSS table for fresh update")
     
     def update_kev_status(self, kev_set):
-        """
-        Mark CVEs that are in the CISA KEV catalog.
-        
-        Args:
-            kev_set: Set of CVE IDs that are actively exploited
-        """
+        """Mark CVEs that are in CISA KEV"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Reset all CVEs to not exploited
         cursor.execute("UPDATE cves SET in_kev = 0")
         
-        # Mark matching CVEs as exploited
         if kev_set:
             placeholders = ','.join(['?'] * len(kev_set))
             query = f"UPDATE cves SET in_kev = 1 WHERE cve_id IN ({placeholders})"
             cursor.execute(query, list(kev_set))
         
-        # Record this update
         now = datetime.now().isoformat()
         cursor.execute('''
             INSERT OR REPLACE INTO updates (source, last_run, records_count)
@@ -207,22 +174,7 @@ class DatabaseHandler:
         print(f"KEV status updated: {len(kev_set)} CVEs marked as exploited")
     
     def get_all_cves(self, limit=1000):
-        """
-        Retrieve CVEs from the database with EPSS scores and calculate priorities.
-        
-        Priority levels:
-        - 🔴 PRIORITY 1+ (IMMEDIATE): Confirmed exploited (in KEV)
-        - 🟠 PRIORITY 1 (This week): EPSS > 0.2 and CVSS > 7.0
-        - 🟡 PRIORITY 2 (Schedule): CVSS > 7.0
-        - 🟢 PRIORITY 3 (Monitor): EPSS > 0.2
-        - ⚪ PRIORITY 4 (Deprioritize): Low severity and low probability
-        
-        Args:
-            limit: Maximum number of CVEs to return
-            
-        Returns:
-            List of CVE dictionaries with priority added
-        """
+        """Get CVEs from database with EPSS scores and priorities"""
         conn = sqlite3.connect(self.db_path)
         
         query = f"""
@@ -245,7 +197,6 @@ class DatabaseHandler:
         df = pd.read_sql_query(query, conn)
         conn.close()
         
-        # Return sample data if database is empty
         if df.empty:
             return self.get_sample_cves()
         
@@ -253,7 +204,6 @@ class DatabaseHandler:
         for _, row in df.iterrows():
             cve = row.to_dict()
             
-            # Calculate priority based on KEV status, EPSS score, and CVSS score
             if cve['in_kev']:
                 priority = "🔴 PRIORITY 1+ (IMMEDIATE)"
             elif cve['epss_score'] > 0.2 and cve['cvss_score'] > 7.0:
@@ -271,12 +221,7 @@ class DatabaseHandler:
         return cves
     
     def get_sample_cves(self):
-        """
-        Provide sample CVEs when database is empty.
-        
-        Returns:
-            List of sample CVE dictionaries for testing/development
-        """
+        """Return sample CVEs only if database is empty"""
         return [
             {
                 'cve_id': 'SAMPLE-2025-001',
@@ -297,15 +242,7 @@ class DatabaseHandler:
         ]
     
     def get_last_update(self, source):
-        """
-        Get the last update timestamp and record count for a data source.
-        
-        Args:
-            source: Data source name ('nvd', 'epss', or 'kev')
-            
-        Returns:
-            Tuple of (last_run, records_count) or None if no updates found
-        """
+        """Get last update time for a source"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
